@@ -1,1 +1,189 @@
+---
+name: openvpn-automation
+description: >-
+  Trigger the openvpn-automation GitLab pipeline via glab CLI to create, delete, get,
+  audit, offboard, restart, or renew OpenVPN users/servers; poll child jobs; scrape
+  1Password share links from job logs; post results to Slack. Use for VPN pipelines,
+  VPN bot/Automations, create/delete VPN access, or OpenVPN profiles.
+---
 
+# OpenVPN Automation Pipeline
+
+Project: `hyperexponential/infrastructure/tools/openvpn-automation`  
+Project ID: `74930740`  
+Pipelines UI: https://gitlab.com/hyperexponential/infrastructure/tools/openvpn-automation/-/pipelines  
+Tool: `glab` (requires `glab auth login` if token expired)
+
+Companion skill: **`jira-my-tickets`** (query 5 + VPN verify checklist) for ticket intake.
+
+Do **not** use old inputs (`USER_EMAIL`, `ENV`, `ENV_TYPE`). Current `main` uses the inputs below.
+
+## Inputs (current `main`)
+
+| Input | Type | Default | Notes |
+|-------|------|---------|-------|
+| `ACTION` | string | `""` | Required. `create`, `delete`, `get`, `audit`, `offboarding`, `restart`, `renew-server-cert` |
+| `ENVS` | array | `[]` | e.g. `dev`, `hx`. For `audit`, empty = discover all OpenVPN envs |
+| `USER_EMAILS` | array | `[]` | Fully-qualified emails only; used as OpenVPN CN end-to-end |
+| `RESTART_SERVERS` | boolean | `true` | When `false`, no restart jobs |
+
+### Action behaviour
+
+- **`create` / `delete` / `get`** — act on `USER_EMAILS` (+ usually `ENVS`)
+- **`audit` / `restart` / `renew-server-cert`** — act on `ENVS`, ignore `USER_EMAILS`
+- **`offboarding`** — discovers environments for `USER_EMAILS`
+
+Default ENVS for user create/delete when unspecified: **`dev,hx`**.
+
+## Preconditions
+
+1. `glab auth status` — if `invalid_grant`, tell human to run `glab auth login` on the laptop worker
+2. Emails must be `@hyperexponential.com` FQDN — never invent
+3. **Mutating gate** — run `glab ci run` only when one of:
+   - User explicitly asked in chat, **or**
+   - Slack ✅ / explicit approve on the VPN bot message (Automation), **or**
+   - Continuing a recreate after a successful delete the user already approved
+4. Scan/cron without approve → do **not** mutate; hand back to `jira-my-tickets` Slack approve template
+
+## Run pipeline
+
+```bash
+glab ci run -R hyperexponential/infrastructure/tools/openvpn-automation \
+  --branch main \
+  -i 'ACTION:string(<action>)' \
+  -i 'ENVS:array(<env1>,<env2>)' \
+  -i 'USER_EMAILS:array(<email1>,<email2>)' \
+  -i 'RESTART_SERVERS:bool(true)'
+```
+
+Typed inputs: `string(...)`, `array(a,b)`, `array()`, `bool(true|false)`. Always quote `-i` values with parentheses.
+
+Capture **pipeline id** and **weburl** from output.
+
+## Poll parent → child → jobs
+
+Parent pipeline has generate/test + bridge `openvpn:trigger` → **child** pipeline with real work.
+
+```bash
+# Parent status
+glab api "projects/74930740/pipelines/<PARENT_ID>"
+
+# Bridge → child id
+glab api "projects/74930740/pipelines/<PARENT_ID>/bridges"
+
+# Child jobs
+glab api "projects/74930740/pipelines/<CHILD_ID>/jobs?per_page=100"
+```
+
+Poll until parent + child `status` ∈ `{success, failed, canceled}`. Prefer waiting on child.
+
+Job name patterns:
+
+| Action | Job name example |
+|--------|------------------|
+| create | `openvpn:create: hx user@hyperexponential.com` |
+| delete | `openvpn:delete: dev user@…` |
+| restart | `openvpn:restart: hx` |
+
+## Scrape 1Password links from create logs
+
+After **create** child jobs succeed, for each `openvpn:create:` job:
+
+```bash
+glab api "projects/74930740/jobs/<JOB_ID>/trace"
+```
+
+Extract blocks matching (per env):
+
+```text
+Your VPN profile is ready for "<ENV>" environment.
+Your username is: <EMAIL>
+...
+https://share.1password.com/s#...
+```
+
+Regex helpers:
+
+- Ready line: `Your VPN profile is ready for "([^"]+)" environment`
+- Username: `Your username is:\s*(\S+)`
+- Share URL: `https://share\.1password\.com/s#[A-Za-z0-9_-]+`
+
+Rules:
+
+- **Never invent** share URLs — only paste what appears in traces
+- One message (or section) per env
+- Treat links as sensitive; do not commit to git or Memories
+- If create succeeded but no URL found → report job URL + ask human to check logs
+
+## Post to Slack (VPN bot)
+
+After scrape, Send to Slack (or equivalent) roughly:
+
+```text
+VPN ready — <TICKET or email>
+• hx — username <email>
+  https://share.1password.com/s#...
+• dev — username <email>
+  https://share.1password.com/s#...
+Pipelines: <parent url>
+Expires ~14 days (see message in log).
+```
+
+On failure: post ticket/email, failed job name, pipeline URL, short error snippet (no secrets).
+
+## Common recipes
+
+### Delete
+
+```bash
+glab ci run -R hyperexponential/infrastructure/tools/openvpn-automation \
+  --branch main \
+  -i 'ACTION:string(delete)' \
+  -i 'ENVS:array(dev,hx)' \
+  -i 'USER_EMAILS:array(user@hyperexponential.com)' \
+  -i 'RESTART_SERVERS:bool(true)'
+```
+
+### Create
+
+```bash
+glab ci run -R hyperexponential/infrastructure/tools/openvpn-automation \
+  --branch main \
+  -i 'ACTION:string(create)' \
+  -i 'ENVS:array(dev,hx)' \
+  -i 'USER_EMAILS:array(user@hyperexponential.com)' \
+  -i 'RESTART_SERVERS:bool(true)'
+```
+
+### Recreate
+
+1. `delete` → wait child success  
+2. `create` → wait → scrape 1Password → Slack  
+
+### Get
+
+```bash
+glab ci run -R hyperexponential/infrastructure/tools/openvpn-automation \
+  --branch main \
+  -i 'ACTION:string(get)' \
+  -i 'ENVS:array(dev)' \
+  -i 'USER_EMAILS:array(user@hyperexponential.com)'
+```
+
+## End-to-end bot flow (Automations / laptop worker)
+
+1. **`jira-my-tickets`** query 5 → VPN candidates + verify checklist  
+2. No approve yet → Slack approve request only  
+3. On ✅ / explicit approve → this skill: `create` (or delete→create)  
+4. Poll bridges/jobs → scrape traces → Slack with 1Password links  
+5. Optionally comment on Jira with pipeline URL (no share secrets in Jira if policy forbids)
+
+Worker: run from repo that contains these skills (`agent worker start` with `--worker-dir` pointing here). Keep `glab` + Atlassian MCP authenticated on that machine.
+
+## Safety
+
+- Mutate only with approval (chat or Slack ✅)
+- Prefer delete→create for recreate
+- Never invent emails or 1Password URLs
+- Do not commit secrets / share links into the repo
+- On auth errors, stop and ask human — do not retry blindly
